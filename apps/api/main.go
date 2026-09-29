@@ -18,6 +18,7 @@ import (
 	"github.com/nersus15/kamscode-meet-v2/internal/db"
 	"github.com/nersus15/kamscode-meet-v2/internal/room"
 	"github.com/nersus15/kamscode-meet-v2/internal/token"
+	"github.com/nersus15/kamscode-meet-v2/internal/turn"
 	"github.com/nersus15/kamscode-meet-v2/internal/user"
 )
 
@@ -27,6 +28,8 @@ type config struct {
 	privateKey   string
 	sfuURL       string
 	cookieSecure bool
+	ipHeader     string
+	ice          turn.Config
 	joinTTL      time.Duration
 	sessionTTL   time.Duration
 	logLevel     slog.Level
@@ -38,6 +41,8 @@ func loadConfig() (config, error) {
 		databaseURL: os.Getenv("DATABASE_URL"),
 		privateKey:  os.Getenv("JOIN_TOKEN_PRIVATE_KEY"),
 		sfuURL:      env("SFU_PUBLIC_URL", "ws://localhost:8080/ws"),
+		ipHeader:    os.Getenv("CLIENT_IP_HEADER"),
+		ice:         turn.FromEnv(os.Getenv),
 		joinTTL:     60 * time.Second,
 		sessionTTL:  30 * 24 * time.Hour,
 	}
@@ -102,11 +107,12 @@ func run() error {
 	}
 
 	srv := api.NewServer(
-		api.Config{SFUURL: cfg.sfuURL, CookieSecure: cfg.cookieSecure},
+		api.Config{SFUURL: cfg.sfuURL, CookieSecure: cfg.cookieSecure, ClientIPHeader: cfg.ipHeader},
 		user.NewStore(pool),
 		auth.NewSessionStore(pool, cfg.sessionTTL),
 		room.NewStore(pool),
 		token.NewSigner(key, cfg.joinTTL),
+		turn.New(cfg.ice),
 	)
 	httpServer := &http.Server{
 		Addr:              cfg.addr,
