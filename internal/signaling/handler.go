@@ -23,6 +23,13 @@ const (
 	closeMediaFailed websocket.StatusCode = 4002 // PeerConnection gagal: boleh reconnect
 )
 
+// Batas ukuran data E2EE yang buram bagi server (base64 JSON dari browser).
+const (
+	maxBundleLen   = 4 << 10
+	maxEnvelopeLen = 8 << 10 // ~2000 karakter teks setelah enkripsi + base64
+	maxChatIDLen   = 64
+)
+
 type Handler struct {
 	server         *sfu.Server
 	verifier       *token.Verifier
@@ -115,6 +122,15 @@ func (s *session) run(r *http.Request) {
 		PeerMediaState: func(info sfu.ParticipantInfo) {
 			s.sendEvent(protocol.TypeMediaState, protocol.MediaStatePayload{ID: info.ID, Mic: info.Mic, Cam: info.Cam})
 		},
+		PeerKey: func(id, bundle string) {
+			s.sendEvent(protocol.TypeParticipantKey, protocol.ParticipantKeyPayload{ID: id, Bundle: bundle})
+		},
+		Chat: func(d sfu.ChatDelivery) {
+			s.sendEvent(protocol.TypeChat, protocol.ChatPayload{
+				ID: d.ID, From: d.From, To: d.To, Broadcast: d.Broadcast,
+				TS: d.TS.UnixMilli(), Envelope: d.Envelope,
+			})
+		},
 	})
 	if err != nil {
 		s.log.Warn("join failed", "err", err)
@@ -171,6 +187,15 @@ func (s *session) handle(m protocol.Message) {
 			return
 		}
 		s.p.SetMediaState(in.Mic, in.Cam)
+	case protocol.TypeE2EEKey:
+		var in protocol.E2EEKeyPayload
+		if err := m.Decode(&in); err != nil || in.Bundle == "" || len(in.Bundle) > maxBundleLen {
+			s.conn.sendError("invalid e2ee-key payload")
+			return
+		}
+		s.p.SetKeyBundle(in.Bundle)
+	case protocol.TypeChatSend:
+		s.handleChat(m)
 	case protocol.TypeLeave:
 		s.leave()
 		s.conn.close()
@@ -325,7 +350,35 @@ func (s *session) sendEvent(t protocol.Type, payload any) {
 }
 
 func toProtocolInfo(i sfu.ParticipantInfo) protocol.ParticipantInfo {
-	return protocol.ParticipantInfo{ID: i.ID, Name: i.Name, Mic: i.Mic, Cam: i.Cam}
+	return protocol.ParticipantInfo{ID: i.ID, Name: i.Name, Mic: i.Mic, Cam: i.Cam, Bundle: i.Bundle}
+}
+
+// handleChat: server tidak bisa membaca pesan; yang diperiksa hanya bentuk dan ukuran.
+func (s *session) handleChat(m protocol.Message) {
+	var in protocol.ChatSendPayload
+	if err := m.Decode(&in); err != nil {
+		s.conn.sendError("invalid chat-send payload")
+		return
+	}
+	switch {
+	case in.ID == "" || len(in.ID) > maxChatIDLen:
+		s.conn.sendError("invalid chat id")
+		return
+	case len(in.To) == 0 || len(in.To) > sfu.MaxChatRecipients || len(in.Envelopes) > sfu.MaxChatRecipients:
+		s.conn.sendError("invalid chat recipients")
+		return
+	}
+	for _, env := range in.Envelopes {
+		if len(env) > maxEnvelopeLen {
+			s.conn.sendError("chat message too large")
+			return
+		}
+	}
+
+	err := s.p.SendChat(sfu.ChatMessage{ID: in.ID, To: in.To, Broadcast: in.Broadcast, Envelopes: in.Envelopes})
+	if err != nil {
+		s.conn.sendError(err.Error())
+	}
 }
 
 func (s *session) sendMessage(t protocol.Type, payload any) {

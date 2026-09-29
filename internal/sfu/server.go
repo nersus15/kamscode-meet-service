@@ -30,14 +30,19 @@ type Outbound struct {
 	PeerJoined     func(ParticipantInfo)
 	PeerLeft       func(participantID string)
 	PeerMediaState func(ParticipantInfo)
+	PeerKey        func(participantID, bundle string)
+
+	// Chat dipanggil untuk setiap pesan yang ditujukan ke (atau gema dari) peserta ini.
+	Chat func(ChatDelivery)
 }
 
 // ParticipantInfo: data seorang peserta yang dilihat peserta lain.
 type ParticipantInfo struct {
-	ID   string
-	Name string
-	Mic  bool
-	Cam  bool
+	ID     string
+	Name   string
+	Mic    bool
+	Cam    bool
+	Bundle string // bundle kunci E2EE; sfu tidak membacanya
 }
 
 // Lock order: Server.mu -> Room.mu. Jangan ambil Server.mu saat memegang Room.mu.

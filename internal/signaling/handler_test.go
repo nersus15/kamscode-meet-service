@@ -3,6 +3,7 @@ package signaling
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -219,5 +220,102 @@ func TestRejoinReplacesOldSession(t *testing.T) {
 	msg.Decode(&ms)
 	if ms.ID != "u-alice.dev" || ms.Mic || ms.Cam {
 		t.Fatalf("unexpected media-state from fresh session: %+v", ms)
+	}
+}
+
+func send(t *testing.T, ctx context.Context, ws *websocket.Conn, typ protocol.Type, payload any) {
+	t.Helper()
+	m, _ := protocol.New(typ, payload)
+	data, _ := json.Marshal(m)
+	if err := ws.Write(ctx, websocket.MessageText, data); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Server hanya meneruskan amplop buram: tiap penerima menerima amplopnya sendiri,
+// peserta di luar daftar penerima tidak menerima apa pun.
+func TestChatE2EE(t *testing.T) {
+	hs, signer := newTestServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	alice := dialAs(t, ctx, hs, signer, "u-alice.dev", "Alice")
+	readUntil(t, ctx, alice, protocol.TypeJoined)
+	send(t, ctx, alice, protocol.TypeE2EEKey, protocol.E2EEKeyPayload{Bundle: "BUNDLE-A"})
+
+	bob := dialAs(t, ctx, hs, signer, "u-bob.dev", "Bob")
+	var bj protocol.JoinedPayload
+	readUntil(t, ctx, bob, protocol.TypeJoined).Decode(&bj)
+	if len(bj.Participants) != 1 || bj.Participants[0].Bundle != "BUNDLE-A" {
+		t.Fatalf("late joiner should get alice's bundle in roster, got %+v", bj.Participants)
+	}
+
+	carol := dialAs(t, ctx, hs, signer, "u-carol.dev", "Carol")
+	readUntil(t, ctx, carol, protocol.TypeJoined)
+	send(t, ctx, carol, protocol.TypeE2EEKey, protocol.E2EEKeyPayload{Bundle: "BUNDLE-C"})
+	var pk protocol.ParticipantKeyPayload
+	readUntil(t, ctx, bob, protocol.TypeParticipantKey).Decode(&pk)
+	if pk.ID != "u-carol.dev" || pk.Bundle != "BUNDLE-C" {
+		t.Fatalf("unexpected participant-key: %+v", pk)
+	}
+
+	// Pesan pribadi ke bob; amplop untuk carol ikut dikirim tapi carol bukan penerima.
+	send(t, ctx, alice, protocol.TypeChatSend, protocol.ChatSendPayload{
+		ID: "m1", To: []string{"u-bob.dev"},
+		Envelopes: map[string]string{"u-bob.dev": "ENV-B1", "u-carol.dev": "ENV-C1"},
+	})
+	var got protocol.ChatPayload
+	readUntil(t, ctx, bob, protocol.TypeChat).Decode(&got)
+	if got.ID != "m1" || got.From != "u-alice.dev" || got.Envelope != "ENV-B1" || got.Broadcast || got.TS == 0 {
+		t.Fatalf("bob got unexpected chat: %+v", got)
+	}
+	var echo protocol.ChatPayload
+	readUntil(t, ctx, alice, protocol.TypeChat).Decode(&echo)
+	if echo.ID != "m1" || echo.Envelope != "" || len(echo.To) != 1 || echo.To[0] != "u-bob.dev" {
+		t.Fatalf("sender echo must not carry an envelope: %+v", echo)
+	}
+
+	// Broadcast: carol hanya menerima amplopnya sendiri, dan pesan pertama yang ia
+	// terima adalah m2 (bukan m1 yang pribadi untuk bob).
+	send(t, ctx, alice, protocol.TypeChatSend, protocol.ChatSendPayload{
+		ID: "m2", To: []string{"u-bob.dev", "u-carol.dev"}, Broadcast: true,
+		Envelopes: map[string]string{"u-bob.dev": "ENV-B2", "u-carol.dev": "ENV-C2"},
+	})
+	var cm protocol.ChatPayload
+	readUntil(t, ctx, carol, protocol.TypeChat).Decode(&cm)
+	if cm.ID != "m2" || cm.Envelope != "ENV-C2" || !cm.Broadcast || len(cm.To) != 2 {
+		t.Fatalf("carol got unexpected chat: %+v", cm)
+	}
+
+	// Penerima tak dikenal saja -> error ke pengirim.
+	send(t, ctx, alice, protocol.TypeChatSend, protocol.ChatSendPayload{
+		ID: "m3", To: []string{"u-ghost.dev"}, Envelopes: map[string]string{"u-ghost.dev": "X"},
+	})
+	var e protocol.ErrorPayload
+	readUntil(t, ctx, alice, protocol.TypeError).Decode(&e)
+	if e.Message != "no recipients in room" {
+		t.Fatalf("unexpected error: %+v", e)
+	}
+}
+
+func TestChatRateLimit(t *testing.T) {
+	hs, signer := newTestServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	alice := dialAs(t, ctx, hs, signer, "u-alice.dev", "Alice")
+	readUntil(t, ctx, alice, protocol.TypeJoined)
+	bob := dialAs(t, ctx, hs, signer, "u-bob.dev", "Bob")
+	readUntil(t, ctx, bob, protocol.TypeJoined)
+
+	for i := range 20 {
+		send(t, ctx, alice, protocol.TypeChatSend, protocol.ChatSendPayload{
+			ID: fmt.Sprintf("m%d", i), To: []string{"u-bob.dev"}, Envelopes: map[string]string{"u-bob.dev": "E"},
+		})
+	}
+	var e protocol.ErrorPayload
+	readUntil(t, ctx, alice, protocol.TypeError).Decode(&e)
+	if e.Message != "sending messages too fast" {
+		t.Fatalf("want rate limit error, got %+v", e)
 	}
 }

@@ -17,6 +17,14 @@ const (
 	TypeParticipantLeft   Type = "participant-left"
 	// Status mic/kamera: browser -> sfu (tanpa id), sfu -> browser lain (dengan id).
 	TypeMediaState Type = "media-state"
+
+	// E2EE: bundle kunci publik (browser -> sfu), diteruskan ke peserta lain.
+	TypeE2EEKey        Type = "e2ee-key"
+	TypeParticipantKey Type = "participant-key"
+
+	// Chat E2EE: browser -> sfu (amplop per penerima), sfu -> tiap penerima (amplopnya sendiri).
+	TypeChatSend Type = "chat-send"
+	TypeChat     Type = "chat"
 )
 
 type Role string
@@ -39,10 +47,38 @@ type JoinedPayload struct {
 }
 
 type ParticipantInfo struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
-	Mic  bool   `json:"mic"`
-	Cam  bool   `json:"cam"`
+	ID     string `json:"id"`
+	Name   string `json:"name"`
+	Mic    bool   `json:"mic"`
+	Cam    bool   `json:"cam"`
+	Bundle string `json:"bundle,omitempty"` // bundle kunci E2EE; buram bagi server
+}
+
+type E2EEKeyPayload struct {
+	Bundle string `json:"bundle"`
+}
+
+type ParticipantKeyPayload struct {
+	ID     string `json:"id"`
+	Bundle string `json:"bundle"`
+}
+
+// ChatSendPayload: Envelopes berisi ciphertext per penerima (participant ID -> amplop buram).
+type ChatSendPayload struct {
+	ID        string            `json:"id"`
+	To        []string          `json:"to"`
+	Broadcast bool              `json:"broadcast"`
+	Envelopes map[string]string `json:"envelopes"`
+}
+
+// ChatPayload: Envelope hanya milik penerima pesan ini; kosong pada gema ke pengirim.
+type ChatPayload struct {
+	ID        string   `json:"id"`
+	From      string   `json:"from"`
+	To        []string `json:"to"`
+	Broadcast bool     `json:"broadcast"`
+	TS        int64    `json:"ts"` // unix milidetik, diisi server
+	Envelope  string   `json:"envelope,omitempty"`
 }
 
 type ParticipantLeftPayload struct {
