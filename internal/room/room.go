@@ -59,6 +59,33 @@ func (s *Store) BySlug(ctx context.Context, slug string) (Room, error) {
 	return r, err
 }
 
+// ListByOwner: room milik user, terbaru dulu.
+func (s *Store) ListByOwner(ctx context.Context, ownerID string) ([]Room, error) {
+	rows, err := s.db.Query(ctx,
+		`SELECT id, slug, name, owner_id, created_at FROM rooms
+		 WHERE owner_id = $1 ORDER BY created_at DESC LIMIT 100`, ownerID)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (Room, error) {
+		var r Room
+		err := row.Scan(&r.ID, &r.Slug, &r.Name, &r.OwnerID, &r.CreatedAt)
+		return r, err
+	})
+}
+
+// Delete menghapus room milik ownerID. Room milik orang lain tidak tersentuh (ErrNotFound).
+func (s *Store) Delete(ctx context.Context, slug, ownerID string) error {
+	tag, err := s.db.Exec(ctx, `DELETE FROM rooms WHERE slug = $1 AND owner_id = $2`, slug, ownerID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // Format xxx-xxxx-xxx; alfabet tanpa huruf/angka yang mudah tertukar (0/o, 1/l/i).
 func newSlug() string {
 	const alphabet = "abcdefghjkmnpqrstuvwxyz23456789"

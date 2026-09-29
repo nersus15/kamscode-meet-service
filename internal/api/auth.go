@@ -64,7 +64,14 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid body")
 		return
 	}
-	u, hash, err := s.users.ByEmail(r.Context(), normalizeEmail(in.Email))
+	email := normalizeEmail(in.Email)
+	// Batas per akun: menahan tebakan password terhadap satu email dari banyak IP.
+	if !s.authByEmail.allow(email) {
+		w.Header().Set("Retry-After", "60")
+		writeError(w, http.StatusTooManyRequests, "too many attempts, try again later")
+		return
+	}
+	u, hash, err := s.users.ByEmail(r.Context(), email)
 	if err != nil && !errors.Is(err, user.ErrNotFound) {
 		internalError(w, "load user", err)
 		return

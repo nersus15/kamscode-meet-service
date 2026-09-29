@@ -3,6 +3,7 @@ package sfu
 import (
 	"fmt"
 	"log/slog"
+	"net"
 	"sync"
 
 	"github.com/pion/interceptor"
@@ -12,7 +13,15 @@ import (
 )
 
 type Config struct {
-	ICEServers []webrtc.ICEServer
+	// ICEServers dipanggil untuk setiap PeerConnection baru (kredensial TURN bisa berganti).
+	// Tidak pernah dipanggil sambil memegang lock; boleh melakukan I/O.
+	ICEServers func() []webrtc.ICEServer
+
+	// UDPPort > 0: semua PeerConnection memakai satu port UDP (UDP mux), cukup satu port
+	// yang dibuka di firewall / dipublikasikan di Docker.
+	UDPPort int
+	// PublicIPs: IP publik yang diumumkan di host candidate (SFU di belakang 1:1 NAT, mis. VPS).
+	PublicIPs []string
 }
 
 // Outbound adalah jalur sfu -> browser, diisi oleh signaling.
@@ -47,8 +56,9 @@ type ParticipantInfo struct {
 
 // Lock order: Server.mu -> Room.mu. Jangan ambil Server.mu saat memegang Room.mu.
 type Server struct {
-	api      *webrtc.API
-	pcConfig webrtc.Configuration
+	api        *webrtc.API
+	iceServers func() []webrtc.ICEServer
+	udpConn    net.PacketConn // UDP mux; nil jika port acak
 
 	mu    sync.Mutex
 	rooms map[string]*Room
@@ -65,15 +75,41 @@ func NewServer(cfg Config) (*Server, error) {
 		return nil, fmt.Errorf("register interceptors: %w", err)
 	}
 
+	se := webrtc.SettingEngine{}
+	var udpConn net.PacketConn
+	if cfg.UDPPort > 0 {
+		conn, err := net.ListenUDP("udp", &net.UDPAddr{Port: cfg.UDPPort})
+		if err != nil {
+			return nil, fmt.Errorf("listen udp :%d: %w", cfg.UDPPort, err)
+		}
+		udpConn = conn
+		se.SetICEUDPMux(webrtc.NewICEUDPMux(nil, conn))
+	}
+	if len(cfg.PublicIPs) > 0 {
+		err := se.SetICEAddressRewriteRules(webrtc.ICEAddressRewriteRule{
+			External:        cfg.PublicIPs,
+			AsCandidateType: webrtc.ICECandidateTypeHost,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("public ip: %w", err)
+		}
+	}
+
 	api := webrtc.NewAPI(
 		webrtc.WithMediaEngine(m),
 		webrtc.WithInterceptorRegistry(ir),
+		webrtc.WithSettingEngine(se),
 	)
 
+	ice := cfg.ICEServers
+	if ice == nil {
+		ice = func() []webrtc.ICEServer { return nil }
+	}
 	return &Server{
-		api:      api,
-		pcConfig: webrtc.Configuration{ICEServers: cfg.ICEServers},
-		rooms:    map[string]*Room{},
+		api:        api,
+		iceServers: ice,
+		udpConn:    udpConn,
+		rooms:      map[string]*Room{},
 	}, nil
 }
 
@@ -81,6 +117,9 @@ func NewServer(cfg Config) (*Server, error) {
 // Jika participant ID yang sama masih ada (reconnect dari perangkat yang sama),
 // sesi lama dikeluarkan dan digantikan.
 func (s *Server) Join(roomID, participantID, name string, out Outbound) (*Participant, []ParticipantInfo, error) {
+	// Di luar lock: mengambil kredensial TURN bisa berupa panggilan HTTP.
+	pcConfig := webrtc.Configuration{ICEServers: s.iceServers()}
+
 	s.mu.Lock()
 	r, ok := s.rooms[roomID]
 	if !ok {
@@ -90,7 +129,7 @@ func (s *Server) Join(roomID, participantID, name string, out Outbound) (*Partic
 	}
 
 	old := r.takeParticipant(participantID)
-	p, others, err := r.addParticipant(participantID, name, out)
+	p, others, err := r.addParticipant(participantID, name, pcConfig, out)
 	if err != nil {
 		if r.isEmpty() {
 			delete(s.rooms, roomID)
@@ -139,5 +178,8 @@ func (s *Server) Close() {
 
 	for _, p := range all {
 		p.close()
+	}
+	if s.udpConn != nil {
+		s.udpConn.Close()
 	}
 }

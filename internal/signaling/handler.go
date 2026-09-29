@@ -1,6 +1,7 @@
 package signaling
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -378,6 +379,19 @@ func (s *session) handleChat(m protocol.Message) {
 	err := s.p.SendChat(sfu.ChatMessage{ID: in.ID, To: in.To, Broadcast: in.Broadcast, Envelopes: in.Envelopes})
 	if err != nil {
 		s.conn.sendError(err.Error())
+		return
+	}
+
+	// Debug: memperlihatkan apa yang benar-benar dilihat server — hanya amplop acak.
+	if s.log.Enabled(context.Background(), slog.LevelDebug) {
+		size, sample := 0, ""
+		for _, env := range in.Envelopes {
+			size += len(env)
+			if sample == "" {
+				sample = env[:min(len(env), 40)] + "…"
+			}
+		}
+		s.log.Debug("chat relayed", "id", in.ID, "recipients", len(in.To), "envelope_bytes", size, "envelope_sample", sample)
 	}
 }
 

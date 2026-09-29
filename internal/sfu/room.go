@@ -35,7 +35,7 @@ func newRoom(id string, s *Server) *Room {
 // Dipanggil oleh Server.Join (Server.mu sudah dipegang).
 // Mengembalikan daftar peserta lain; mendaftar dan mengabari peserta lain terjadi
 // di bawah Room.mu yang sama, sehingga tiap pasangan peserta saling tahu tepat sekali.
-func (r *Room) addParticipant(participantID, name string, out Outbound) (*Participant, []ParticipantInfo, error) {
+func (r *Room) addParticipant(participantID, name string, pcConfig webrtc.Configuration, out Outbound) (*Participant, []ParticipantInfo, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -65,7 +65,7 @@ func (r *Room) addParticipant(participantID, name string, out Outbound) (*Partic
 		}
 	}
 
-	pub, err := peer.NewPublisher(r.server.api, r.server.pcConfig, participantID,
+	pub, err := peer.NewPublisher(r.server.api, pcConfig, participantID,
 		peer.Callbacks{
 			OnICECandidate: func(c webrtc.ICECandidateInit) {
 				out.SendCandidate(peer.RolePublisher, c)
@@ -81,7 +81,7 @@ func (r *Room) addParticipant(participantID, name string, out Outbound) (*Partic
 		return nil, nil, err
 	}
 
-	sub, err := peer.NewSubscriber(r.server.api, r.server.pcConfig, participantID,
+	sub, err := peer.NewSubscriber(r.server.api, pcConfig, participantID,
 		peer.Callbacks{
 			OnICECandidate: func(c webrtc.ICECandidateInit) {
 				out.SendCandidate(peer.RoleSubscriber, c)

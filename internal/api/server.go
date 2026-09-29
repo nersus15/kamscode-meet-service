@@ -12,6 +12,7 @@ import (
 	"github.com/nersus15/kamscode-meet-v2/internal/auth"
 	"github.com/nersus15/kamscode-meet-v2/internal/room"
 	"github.com/nersus15/kamscode-meet-v2/internal/token"
+	"github.com/nersus15/kamscode-meet-v2/internal/turn"
 	"github.com/nersus15/kamscode-meet-v2/internal/user"
 )
 
@@ -21,8 +22,9 @@ const (
 )
 
 type Config struct {
-	SFUURL       string // dikirim ke browser bersama join token
-	CookieSecure bool   // true di produksi (HTTPS)
+	SFUURL         string // dikirim ke browser bersama join token
+	CookieSecure   bool   // true di produksi (HTTPS)
+	ClientIPHeader string // mis. "CF-Connecting-IP" di belakang Cloudflare; kosong = RemoteAddr
 }
 
 type Server struct {
@@ -31,21 +33,34 @@ type Server struct {
 	sessions *auth.SessionStore
 	rooms    *room.Store
 	signer   *token.Signer
+	ice      *turn.Provider
+
+	// Penahan brute force: per IP (semua percobaan) dan per email (login).
+	authByIP    *limiter
+	authByEmail *limiter
 }
 
-func NewServer(cfg Config, users *user.Store, sessions *auth.SessionStore, rooms *room.Store, signer *token.Signer) *Server {
-	return &Server{cfg: cfg, users: users, sessions: sessions, rooms: rooms, signer: signer}
+func NewServer(cfg Config, users *user.Store, sessions *auth.SessionStore, rooms *room.Store, signer *token.Signer, ice *turn.Provider) *Server {
+	return &Server{
+		cfg: cfg, users: users, sessions: sessions, rooms: rooms, signer: signer, ice: ice,
+		authByIP:    newLimiter(20, 10), // 20/menit, lonjakan 10
+		authByEmail: newLimiter(5, 5),   // 5/menit per akun
+	}
 }
 
 func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("POST /api/auth/register", s.register)
-	mux.HandleFunc("POST /api/auth/login", s.login)
+	mux.HandleFunc("GET /api/healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok")) })
+
+	mux.HandleFunc("POST /api/auth/register", s.limitAuth(s.register))
+	mux.HandleFunc("POST /api/auth/login", s.limitAuth(s.login))
 	mux.HandleFunc("POST /api/auth/logout", s.logout)
 	mux.HandleFunc("GET /api/auth/me", s.requireUser(s.me))
 
+	mux.HandleFunc("GET /api/rooms", s.requireUser(s.listRooms))
 	mux.HandleFunc("POST /api/rooms", s.requireUser(s.createRoom))
+	mux.HandleFunc("DELETE /api/rooms/{slug}", s.requireUser(s.deleteRoom))
 	mux.HandleFunc("GET /api/rooms/{slug}", s.requireUser(s.getRoom))
 	mux.HandleFunc("POST /api/rooms/{slug}/join", s.requireUser(s.joinRoom))
 
@@ -53,6 +68,18 @@ func (s *Server) Routes() http.Handler {
 }
 
 // ---------- middleware ----------
+
+// limitAuth membatasi percobaan register/login per IP klien.
+func (s *Server) limitAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !s.authByIP.allow(clientIP(r, s.cfg.ClientIPHeader)) {
+			w.Header().Set("Retry-After", "60")
+			writeError(w, http.StatusTooManyRequests, "too many attempts, try again later")
+			return
+		}
+		next(w, r)
+	}
+}
 
 // requireUser memuat user dari cookie sesi; tanpa sesi valid -> 401.
 func (s *Server) requireUser(next func(http.ResponseWriter, *http.Request, user.User)) http.HandlerFunc {

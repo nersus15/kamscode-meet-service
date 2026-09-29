@@ -17,6 +17,11 @@ const (
 	writeTimeout = 5 * time.Second
 	flushTimeout = time.Second
 	readLimit    = 64 << 10
+
+	// Ping berkala: Cloudflare (~100 detik) dan HAProxy memutus WS yang diam, dan ping juga
+	// mendeteksi klien yang hilang tanpa menutup koneksi (jaringan putus).
+	pingInterval = 25 * time.Second
+	pingTimeout  = 10 * time.Second
 )
 
 // conn membungkus satu koneksi WS: satu pembaca (pemanggil readLoop) dan satu penulis (writeLoop).
@@ -41,7 +46,29 @@ func newConn(ws *websocket.Conn, log *slog.Logger) *conn {
 		done: make(chan struct{}),
 	}
 	go c.writeLoop()
+	go c.pingLoop()
 	return c
+}
+
+// pingLoop: Ping coder menunggu pong, yang diproses oleh Read di readLoop.
+func (c *conn) pingLoop() {
+	t := time.NewTicker(pingInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-c.done:
+			return
+		case <-t.C:
+			ctx, cancel := context.WithTimeout(context.Background(), pingTimeout)
+			err := c.ws.Ping(ctx)
+			cancel()
+			if err != nil {
+				c.log.Info("ws ping failed", "err", err)
+				c.closeWith(websocket.StatusGoingAway, "ping timeout")
+				return
+			}
+		}
+	}
 }
 
 func (c *conn) send(m protocol.Message) bool {
