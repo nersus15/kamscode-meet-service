@@ -1,0 +1,42 @@
+# Potongan HAProxy untuk kamscode meet (satu domain, dirutekan per path).
+# Cloudflare Tunnel -> HAProxy :80 -> node Swarm (ingress mesh).
+
+defaults
+    mode    http
+    timeout connect 5s
+    timeout client  50s
+    timeout server  50s
+    # WebSocket: setelah upgrade, koneksi dianggap "tunnel". Tanpa ini WS diputus
+    # saat diam 50 detik. SFU juga mengirim ping tiap 25 detik.
+    timeout tunnel  1h
+
+frontend http_in
+    bind *:80
+    acl is_meet hdr(host) -i meet.domain-anda.com
+    acl is_api  path_beg /api/
+    acl is_ws   path /ws
+
+    use_backend meet_sfu if is_meet is_ws
+    use_backend meet_api if is_meet is_api
+    use_backend meet_web if is_meet
+
+backend meet_web
+    balance roundrobin
+    option httpchk GET /
+    server node1 192.168.1.51:8090 check
+    server node2 192.168.1.52:8090 check
+    server node3 192.168.1.53:8090 check
+
+backend meet_api
+    balance roundrobin
+    option httpchk GET /api/healthz
+    server node1 192.168.1.51:8081 check
+    server node2 192.168.1.52:8081 check
+    server node3 192.168.1.53:8081 check
+
+backend meet_sfu
+    # SFU hanya 1 replika; ingress mesh meneruskan dari node mana pun ke replika itu.
+    option httpchk GET /healthz
+    server node1 192.168.1.51:8080 check
+    server node2 192.168.1.52:8080 check
+    server node3 192.168.1.53:8080 check

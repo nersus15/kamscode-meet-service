@@ -1,0 +1,42 @@
+# Docker Swarm stack:  docker stack deploy -c infra/stack.yml meet
+# Env dari infra/prod.env (lihat infra/prod.env.example). Build image: make docker-build.
+#
+# Routing ke service dilakukan HAProxy (infra/haproxy.cfg.example) lewat port ingress:
+#   web :8090   api :8081   sfu :8080
+services:
+  web:
+    image: kamscode-meet-web:latest
+    ports:
+      - "8090:80"
+    deploy:
+      replicas: 2
+      restart_policy: { condition: on-failure }
+
+  api:
+    image: kamscode-meet-api:latest
+    env_file: prod.env
+    ports:
+      - "8081:8081"
+    deploy:
+      # Stateless (sesi login di Postgres); migrasi aman dijalankan beberapa replika (advisory lock).
+      replicas: 2
+      restart_policy: { condition: on-failure }
+
+  sfu:
+    image: kamscode-meet-sfu:latest
+    env_file: prod.env
+    ports:
+      # Signaling WebSocket (TCP) boleh lewat ingress mesh.
+      - "8080:8080"
+      # Opsi A saja: port UDP media harus mode host (ingress mesh tidak cocok untuk media).
+      # - target: 50000
+      #   published: 50000
+      #   protocol: udp
+      #   mode: host
+    deploy:
+      # SFU menyimpan room di memori: HARUS 1 replika (peserta satu room wajib di SFU yang sama).
+      replicas: 1
+      restart_policy: { condition: on-failure }
+      # Opsi A: kunci ke node yang port UDP-nya dibuka, mis.:
+      # placement:
+      #   constraints: [node.labels.sfu == true]

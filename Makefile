@@ -1,4 +1,4 @@
-.PHONY: run-sfu run-api run-web genkey db-up db-down fmt vet test
+.PHONY: run-sfu run-api run-web genkey db-up db-down fmt vet test docker-build
 
 # Muat .env jika ada.
 ifneq (,$(wildcard .env))
@@ -32,3 +32,9 @@ vet:
 
 test:
 	go test -race ./...
+
+# Image produksi (web dibuat dari repo kamscode-meet-web).
+docker-build:
+	docker build --build-arg APP=api -t kamscode-meet-api:latest .
+	docker build --build-arg APP=sfu -t kamscode-meet-sfu:latest .
+	docker build -t kamscode-meet-web:latest ../kamscode-meet-web
