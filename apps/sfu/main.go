@@ -16,12 +16,14 @@ import (
 
 	"github.com/nersus15/kamscode-meet-v2/internal/sfu"
 	"github.com/nersus15/kamscode-meet-v2/internal/signaling"
+	"github.com/nersus15/kamscode-meet-v2/internal/token"
 )
 
 type config struct {
 	addr           string
 	stunURLs       []string
 	allowedOrigins []string
+	publicKey      string
 	logLevel       slog.Level
 }
 
@@ -30,6 +32,10 @@ func loadConfig() (config, error) {
 		addr:           env("SFU_ADDR", ":8080"),
 		stunURLs:       splitList(env("SFU_STUN_URLS", "")),
 		allowedOrigins: splitList(env("SFU_ALLOWED_ORIGINS", "localhost:5173")),
+		publicKey:      os.Getenv("JOIN_TOKEN_PUBLIC_KEY"),
+	}
+	if cfg.publicKey == "" {
+		return cfg, errors.New("JOIN_TOKEN_PUBLIC_KEY is required (generate with: go run ./apps/api -genkey)")
 	}
 	if err := cfg.logLevel.UnmarshalText([]byte(env("LOG_LEVEL", "info"))); err != nil {
 		return cfg, err
@@ -56,8 +62,14 @@ func main() {
 		os.Exit(1)
 	}
 
+	pub, err := token.ParsePublicKey(cfg.publicKey)
+	if err != nil {
+		slog.Error("join token key", "err", err)
+		os.Exit(1)
+	}
+
 	mux := http.NewServeMux()
-	mux.Handle("/ws", signaling.NewHandler(server, cfg.allowedOrigins))
+	mux.Handle("/ws", signaling.NewHandler(server, token.NewVerifier(pub), cfg.allowedOrigins))
 
 	// Koneksi WS sudah di-hijack sehingga tidak ikut ditutup oleh Shutdown.
 	// Membatalkan baseCtx membatalkan r.Context() yang dipakai readLoop.

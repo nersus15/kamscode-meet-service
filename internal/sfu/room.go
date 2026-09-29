@@ -33,19 +33,25 @@ func newRoom(id string, s *Server) *Room {
 }
 
 // Dipanggil oleh Server.Join (Server.mu sudah dipegang).
-func (r *Room) addParticipant(participantID string, out Outbound) (*Participant, error) {
+// Mengembalikan daftar peserta lain; mendaftar dan mengabari peserta lain terjadi
+// di bawah Room.mu yang sama, sehingga tiap pasangan peserta saling tahu tepat sekali.
+func (r *Room) addParticipant(participantID, name string, out Outbound) (*Participant, []ParticipantInfo, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	if _, exists := r.participants[participantID]; exists {
-		return nil, fmt.Errorf("participant %s already in room %s", participantID, r.ID)
+		return nil, nil, fmt.Errorf("participant %s already in room %s", participantID, r.ID)
 	}
 
 	p := &Participant{
 		ID:      participantID,
+		Name:    name,
 		Room:    r,
 		Tracks:  map[string]MediaTrack{},
+		out:     out,
 		sources: map[string]Source{},
+		mic:     true,
+		cam:     true,
 	}
 
 	// PC failed pada publisher maupun subscriber mengeluarkan participant.
@@ -53,8 +59,8 @@ func (r *Room) addParticipant(participantID string, out Outbound) (*Participant,
 		if state != webrtc.PeerConnectionStateFailed {
 			return
 		}
-		r.server.Leave(r.ID, participantID)
-		if out.Closed != nil {
+		// Hanya beri tahu signaling jika p memang dikeluarkan (bukan sesi lama yang sudah diganti).
+		if r.server.Leave(p) && out.Closed != nil {
 			out.Closed()
 		}
 	}
@@ -72,7 +78,7 @@ func (r *Room) addParticipant(participantID string, out Outbound) (*Participant,
 		},
 	)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	sub, err := peer.NewSubscriber(r.server.api, r.server.pcConfig, participantID,
@@ -92,18 +98,43 @@ func (r *Room) addParticipant(participantID string, out Outbound) (*Participant,
 		if cerr := pub.Close(); cerr != nil {
 			slog.Warn("close publisher", "participant", participantID, "err", cerr)
 		}
-		return nil, err
+		return nil, nil, err
 	}
 
 	p.Publisher = pub
 	p.Subscriber = sub
+
+	others := make([]ParticipantInfo, 0, len(r.participants))
+	for _, o := range r.participants {
+		others = append(others, o.infoLocked())
+	}
+	info := p.infoLocked()
+	r.notifyLocked(nil, func(o Outbound) {
+		if o.PeerJoined != nil {
+			o.PeerJoined(info)
+		}
+	})
+
 	r.participants[participantID] = p
-	slog.Info("participant joined", "room", r.ID, "participant", participantID)
-	return p, nil
+	slog.Info("participant joined", "room", r.ID, "participant", participantID, "name", name)
+	return p, others, nil
 }
 
 // Dipanggil oleh Server.Leave. Tidak menutup PC; itu dilakukan pemanggil di luar lock.
-func (r *Room) removeParticipant(participantID string) *Participant {
+func (r *Room) removeParticipant(p *Participant) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.participants[p.ID] != p {
+		return false
+	}
+	r.removeLocked(p)
+	return true
+}
+
+// takeParticipant mengeluarkan participant dengan ID tertentu (untuk digantikan).
+// Dipanggil oleh Server.Join (Server.mu dipegang). Pemanggil wajib evict() di luar lock.
+func (r *Room) takeParticipant(participantID string) *Participant {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -111,9 +142,29 @@ func (r *Room) removeParticipant(participantID string) *Participant {
 	if !ok {
 		return nil
 	}
-	delete(r.participants, participantID)
-	slog.Info("participant left", "room", r.ID, "participant", participantID)
+	r.removeLocked(p)
+	slog.Info("participant replaced", "room", r.ID, "participant", participantID)
 	return p
+}
+
+func (r *Room) removeLocked(p *Participant) {
+	delete(r.participants, p.ID)
+	r.notifyLocked(nil, func(o Outbound) {
+		if o.PeerLeft != nil {
+			o.PeerLeft(p.ID)
+		}
+	})
+	slog.Info("participant left", "room", r.ID, "participant", p.ID)
+}
+
+// notifyLocked memanggil fn untuk Outbound setiap peserta kecuali except.
+// Dipanggil sambil memegang r.mu; callback Outbound tidak memblok (conn.send non-blocking).
+func (r *Room) notifyLocked(except *Participant, fn func(Outbound)) {
+	for _, o := range r.participants {
+		if o != except {
+			fn(o.out)
+		}
+	}
 }
 
 func (r *Room) removeAll() []*Participant {

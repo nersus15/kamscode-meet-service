@@ -13,29 +13,40 @@ import (
 	"github.com/nersus15/kamscode-meet-v2/internal/protocol"
 	"github.com/nersus15/kamscode-meet-v2/internal/sfu"
 	"github.com/nersus15/kamscode-meet-v2/internal/sfu/peer"
+	"github.com/nersus15/kamscode-meet-v2/internal/token"
+)
+
+// Kode penutupan WS khusus aplikasi (rentang 4000-4999). Browser memakainya untuk
+// memutuskan apakah boleh menyambung ulang otomatis.
+const (
+	closeReplaced    websocket.StatusCode = 4001 // digantikan sesi lain: jangan reconnect
+	closeMediaFailed websocket.StatusCode = 4002 // PeerConnection gagal: boleh reconnect
 )
 
 type Handler struct {
 	server         *sfu.Server
+	verifier       *token.Verifier
 	originPatterns []string
 }
 
 // originPatterns: origin lain yang diizinkan (mis. "localhost:5173" untuk dev server Vite).
-func NewHandler(server *sfu.Server, originPatterns []string) *Handler {
-	return &Handler{server: server, originPatterns: originPatterns}
+func NewHandler(server *sfu.Server, verifier *token.Verifier, originPatterns []string) *Handler {
+	return &Handler{server: server, verifier: verifier, originPatterns: originPatterns}
 }
 
+// Browser tidak bisa mengirim header Authorization saat membuka WebSocket, jadi join token
+// lewat query. Aman karena token sekali pakai, berumur 60 detik, dan URL tidak pernah di-log.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// TEMPORARY (Milestone 1-2): diganti join token di Milestone 3.
-	roomID := r.URL.Query().Get("room")
-	userID := r.URL.Query().Get("user")
-	if roomID == "" || userID == "" {
-		http.Error(w, "room and user are required", http.StatusBadRequest)
+	claims, err := h.verifier.Verify(r.URL.Query().Get("token"))
+	if err != nil {
+		slog.Info("join token rejected", "err", err, "remote", r.RemoteAddr)
+		http.Error(w, "invalid or expired token", http.StatusUnauthorized)
 		return
 	}
-	// ":" dipakai sebagai pemisah stream screen ("alice:screen").
+	roomID, userID := claims.Room, claims.ParticipantID()
+	// ":" dipakai sebagai pemisah stream screen ("alice:screen"). api tidak pernah membuatnya, tapi tetap dicek.
 	if strings.Contains(userID, ":") {
-		http.Error(w, "user must not contain ':'", http.StatusBadRequest)
+		http.Error(w, "invalid participant id", http.StatusBadRequest)
 		return
 	}
 
@@ -45,13 +56,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log := slog.With("room", roomID, "participant", userID)
+	log := slog.With("room", roomID, "participant", userID, "name", claims.Name, "role", claims.Role)
 	s := &session{
 		server:  h.server,
 		conn:    newConn(ws, log),
 		log:     log,
 		roomID:  roomID,
 		userID:  userID,
+		name:    claims.Name,
 		pending: map[peer.Role][]webrtc.ICECandidateInit{},
 		ready:   map[peer.Role]bool{},
 		offers:  map[peer.Role]string{},
@@ -66,6 +78,7 @@ type session struct {
 	log    *slog.Logger
 	roomID string
 	userID string
+	name   string // dari join token
 	p      *sfu.Participant
 
 	left atomic.Bool
@@ -74,23 +87,36 @@ type session struct {
 	//   joined -> offer (subscriber) ; SDP (answer/offer) per role -> candidate role itu.
 	mu      sync.Mutex
 	joined  bool
+	early   []protocol.Message   // event roster sebelum joined terkirim
 	offers  map[peer.Role]string // offer yang dibuat sebelum joined terkirim (maks. satu per role)
 	ready   map[peer.Role]bool   // SDP role ini sudah terkirim, candidate boleh lewat
 	pending map[peer.Role][]webrtc.ICECandidateInit
 }
 
 func (s *session) run(r *http.Request) {
-	p, err := s.server.Join(s.roomID, s.userID, sfu.Outbound{
+	p, others, err := s.server.Join(s.roomID, s.userID, s.name, sfu.Outbound{
 		SendCandidate: s.sendCandidate,
 		SendOffer:     s.sendOffer,
 		Closed: func() {
 			// sfu sudah memanggil Leave sendiri; jangan panggil lagi.
 			s.left.Store(true)
-			s.conn.close()
+			s.conn.closeWith(closeMediaFailed, "media connection failed")
+		},
+		Replaced: func() {
+			s.left.Store(true)
+			s.conn.closeWith(closeReplaced, "replaced by a newer session")
+		},
+		PeerJoined: func(info sfu.ParticipantInfo) {
+			s.sendEvent(protocol.TypeParticipantJoined, toProtocolInfo(info))
+		},
+		PeerLeft: func(id string) {
+			s.sendEvent(protocol.TypeParticipantLeft, protocol.ParticipantLeftPayload{ID: id})
+		},
+		PeerMediaState: func(info sfu.ParticipantInfo) {
+			s.sendEvent(protocol.TypeMediaState, protocol.MediaStatePayload{ID: info.ID, Mic: info.Mic, Cam: info.Cam})
 		},
 	})
 	if err != nil {
-		// Jangan Leave: participant dengan ID ini milik koneksi lain.
 		s.log.Warn("join failed", "err", err)
 		s.conn.sendError(err.Error())
 		s.conn.close()
@@ -98,9 +124,18 @@ func (s *session) run(r *http.Request) {
 	}
 	s.p = p
 
+	roster := make([]protocol.ParticipantInfo, len(others))
+	for i, o := range others {
+		roster[i] = toProtocolInfo(o)
+	}
+
 	s.mu.Lock()
-	s.sendMessage(protocol.TypeJoined, protocol.JoinedPayload{RoomID: s.roomID, ParticipantID: p.ID})
+	s.sendMessage(protocol.TypeJoined, protocol.JoinedPayload{RoomID: s.roomID, ParticipantID: p.ID, Participants: roster})
 	s.joined = true
+	for _, m := range s.early {
+		s.conn.send(m)
+	}
+	s.early = nil
 	for role, sdp := range s.offers {
 		s.sendSDPLocked(protocol.TypeOffer, role, sdp)
 	}
@@ -113,11 +148,11 @@ func (s *session) run(r *http.Request) {
 	s.conn.close()
 }
 
-// leave memastikan sesi ini memanggil server.Leave paling banyak sekali,
-// agar tidak mengeluarkan participant baru dengan ID yang sama.
+// leave memanggil server.Leave paling banyak sekali per sesi. Server.Leave membandingkan
+// pointer, jadi sesi lama yang sudah digantikan tidak bisa mengeluarkan sesi baru.
 func (s *session) leave() {
 	if s.left.CompareAndSwap(false, true) {
-		s.server.Leave(s.roomID, s.userID)
+		s.server.Leave(s.p)
 	}
 }
 
@@ -129,6 +164,13 @@ func (s *session) handle(m protocol.Message) {
 		s.handleAnswer(m)
 	case protocol.TypeCandidate:
 		s.handleCandidate(m)
+	case protocol.TypeMediaState:
+		var in protocol.MediaStatePayload
+		if err := m.Decode(&in); err != nil {
+			s.conn.sendError("invalid media-state payload")
+			return
+		}
+		s.p.SetMediaState(in.Mic, in.Cam)
 	case protocol.TypeLeave:
 		s.leave()
 		s.conn.close()
@@ -263,6 +305,27 @@ func (s *session) sendCandidateNow(role peer.Role, c webrtc.ICECandidateInit) {
 			UsernameFragment: c.UsernameFragment,
 		},
 	})
+}
+
+// sendEvent dipanggil sfu sambil memegang Room.mu: hanya antre, tidak memblok.
+// Event yang datang sebelum joined terkirim ditahan agar joined selalu pesan pertama.
+func (s *session) sendEvent(t protocol.Type, payload any) {
+	m, err := protocol.New(t, payload)
+	if err != nil {
+		s.log.Error("encode message", "type", t, "err", err)
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.joined {
+		s.early = append(s.early, m)
+		return
+	}
+	s.conn.send(m)
+}
+
+func toProtocolInfo(i sfu.ParticipantInfo) protocol.ParticipantInfo {
+	return protocol.ParticipantInfo{ID: i.ID, Name: i.Name, Mic: i.Mic, Cam: i.Cam}
 }
 
 func (s *session) sendMessage(t protocol.Type, payload any) {

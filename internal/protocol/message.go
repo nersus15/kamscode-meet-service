@@ -11,6 +11,12 @@ const (
 	TypeCandidate Type = "candidate"
 	TypeLeave     Type = "leave"
 	TypeError     Type = "error"
+
+	// Roster: sfu -> browser.
+	TypeParticipantJoined Type = "participant-joined"
+	TypeParticipantLeft   Type = "participant-left"
+	// Status mic/kamera: browser -> sfu (tanpa id), sfu -> browser lain (dengan id).
+	TypeMediaState Type = "media-state"
 )
 
 type Role string
@@ -28,6 +34,25 @@ type Message struct {
 type JoinedPayload struct {
 	RoomID        string `json:"roomId"`
 	ParticipantID string `json:"participantId"`
+	// Peserta lain yang sudah ada di room saat join.
+	Participants []ParticipantInfo `json:"participants"`
+}
+
+type ParticipantInfo struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	Mic  bool   `json:"mic"`
+	Cam  bool   `json:"cam"`
+}
+
+type ParticipantLeftPayload struct {
+	ID string `json:"id"`
+}
+
+type MediaStatePayload struct {
+	ID  string `json:"id,omitempty"`
+	Mic bool   `json:"mic"`
+	Cam bool   `json:"cam"`
 }
 
 type SDPPayload struct {

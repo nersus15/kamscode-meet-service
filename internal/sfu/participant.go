@@ -8,12 +8,39 @@ import (
 
 type Participant struct {
 	ID         string
+	Name       string
 	Room       *Room
 	Publisher  *peer.Peer
 	Subscriber *peer.Peer
 	Tracks     map[string]MediaTrack
 
-	sources map[string]Source // mid -> source dari offer publisher; dijaga Room.mu
+	out Outbound
+
+	// Dijaga Room.mu.
+	sources  map[string]Source // mid -> source dari offer publisher
+	mic, cam bool              // status yang dilaporkan browser (media-state)
+}
+
+// infoLocked: dipanggil sambil memegang Room.mu.
+func (p *Participant) infoLocked() ParticipantInfo {
+	return ParticipantInfo{ID: p.ID, Name: p.Name, Mic: p.mic, Cam: p.cam}
+}
+
+// SetMediaState menyimpan status mic/kamera lalu mengabarkannya ke peserta lain.
+func (p *Participant) SetMediaState(mic, cam bool) {
+	r := p.Room
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.participants[p.ID] != p {
+		return // sudah keluar
+	}
+	p.mic, p.cam = mic, cam
+	info := p.infoLocked()
+	r.notifyLocked(p, func(out Outbound) {
+		if out.PeerMediaState != nil {
+			out.PeerMediaState(info)
+		}
+	})
 }
 
 // SetTrackSources dipanggil signaling sebelum Answer, agar OnTrack tahu source tiap mid.
@@ -34,6 +61,17 @@ func (p *Participant) Peer(role peer.Role) *peer.Peer {
 		return p.Subscriber
 	}
 	return nil
+}
+
+// evict: sesi lama digantikan. Beri tahu signaling (tutup WS) lalu tutup PC. Aman untuk nil.
+func (p *Participant) evict() {
+	if p == nil {
+		return
+	}
+	if p.out.Replaced != nil {
+		p.out.Replaced()
+	}
+	p.close()
 }
 
 func (p *Participant) close() {

@@ -22,6 +22,22 @@ type Outbound struct {
 	SendOffer func(role peer.Role, sdp string)
 	// Closed dipanggil saat sfu sendiri yang mengeluarkan participant (mis. PC failed).
 	Closed func()
+	// Replaced dipanggil saat sesi ini digantikan join baru dengan participant ID yang sama.
+	Replaced func()
+
+	// Roster. Dipanggil sambil memegang Room.mu agar urutan join/leave konsisten
+	// untuk semua peserta, jadi implementasi tidak boleh memblok atau memanggil balik sfu.
+	PeerJoined     func(ParticipantInfo)
+	PeerLeft       func(participantID string)
+	PeerMediaState func(ParticipantInfo)
+}
+
+// ParticipantInfo: data seorang peserta yang dilihat peserta lain.
+type ParticipantInfo struct {
+	ID   string
+	Name string
+	Mic  bool
+	Cam  bool
 }
 
 // Lock order: Server.mu -> Room.mu. Jangan ambil Server.mu saat memegang Room.mu.
@@ -56,7 +72,10 @@ func NewServer(cfg Config) (*Server, error) {
 	}, nil
 }
 
-func (s *Server) Join(roomID, participantID string, out Outbound) (*Participant, error) {
+// Join mengembalikan participant baru beserta daftar peserta lain yang sudah ada.
+// Jika participant ID yang sama masih ada (reconnect dari perangkat yang sama),
+// sesi lama dikeluarkan dan digantikan.
+func (s *Server) Join(roomID, participantID, name string, out Outbound) (*Participant, []ParticipantInfo, error) {
 	s.mu.Lock()
 	r, ok := s.rooms[roomID]
 	if !ok {
@@ -65,41 +84,43 @@ func (s *Server) Join(roomID, participantID string, out Outbound) (*Participant,
 		slog.Info("room created", "room", roomID)
 	}
 
-	p, err := r.addParticipant(participantID, out)
+	old := r.takeParticipant(participantID)
+	p, others, err := r.addParticipant(participantID, name, out)
 	if err != nil {
 		if r.isEmpty() {
 			delete(s.rooms, roomID)
 		}
 		s.mu.Unlock()
-		return nil, err
+		old.evict()
+		return nil, nil, err
 	}
 	s.mu.Unlock()
 
-	// Di luar Server.mu: subscribeExisting memanggil Pion (AddTrack).
+	// Di luar lock: menutup PC lama dan AddTrack memanggil Pion.
+	old.evict()
 	r.subscribeExisting(p)
-	return p, nil
+	return p, others, nil
 }
 
 // Leave idempotent: aman dipanggil dari WS close, pesan leave, maupun PC failed.
-func (s *Server) Leave(roomID, participantID string) {
+// Membandingkan pointer, bukan ID: sesi lama yang sudah digantikan tidak bisa
+// mengeluarkan sesi baru dengan ID yang sama. Mengembalikan true jika p benar-benar dikeluarkan.
+func (s *Server) Leave(p *Participant) bool {
 	s.mu.Lock()
-	r, ok := s.rooms[roomID]
-	if !ok {
+	r := p.Room
+	if s.rooms[r.ID] != r || !r.removeParticipant(p) {
 		s.mu.Unlock()
-		return
+		return false
 	}
-
-	p := r.removeParticipant(participantID)
 	if r.isEmpty() {
-		delete(s.rooms, roomID)
-		slog.Info("room closed", "room", roomID)
+		delete(s.rooms, r.ID)
+		slog.Info("room closed", "room", r.ID)
 	}
 	s.mu.Unlock()
 
 	// Close di luar lock: Pion bisa memicu callback yang kembali ke Leave.
-	if p != nil {
-		p.close()
-	}
+	p.close()
+	return true
 }
 
 func (s *Server) Close() {
